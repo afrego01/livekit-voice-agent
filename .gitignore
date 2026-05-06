@@ -1,0 +1,37 @@
+# Python bytecode and artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Caches and test output
+.cache/
+.pytest_cache/
+.ruff_cache/
+coverage/
+
+# Logs and temp files
+*.log
+*.gz
+*.tgz
+.tmp
+
+# Environment variables (contains secrets)
+.env
+.env.*
+
+# Agent entry point (project-specific, not for repo)
+agent.py
+
+# Editor, OS
+.idea/
+.vscode/
+.DS_Store
