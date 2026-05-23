@@ -145,20 +145,31 @@ async def revisar_cobertura(
     numero: str,
     colonia: str,
     municipio: str,
+    respuesta_confirmacion: str,
     codigo_postal: str | None = None,
     numero_interior: str | None = None,
 ) -> str:
     """Consulta si hay cobertura de internet en la dirección del cliente.
-    Solo usa esta herramienta cuando tengas al menos calle, número, colonia y municipio.
+    Solo usa esta herramienta cuando tengas al menos calle, número, colonia y municipio
+    Y el cliente haya confirmado explícitamente que los datos son correctos.
 
     Args:
         calle: Nombre completo de la calle.
-        numero: Número exterior de la dirección.
+        numero: Número exterior de la dirección SIEMPRE en dígitos (ej: "128", nunca "ciento veintiocho"). Convierte cualquier número en texto a su forma numérica antes de pasar este argumento.
         colonia: Nombre de la colonia o fraccionamiento.
         municipio: Municipio o delegación.
+        respuesta_confirmacion: Exactamente lo que dijo el cliente al confirmar los datos (ej: "Sí", "Correcto", "Así es"). NUNCA pases "Sigo aquí", "Ok", "Gracias" ni respuestas que no sean una confirmación explícita de los datos.
         codigo_postal: Código postal (opcional a 5 dígitos).
         numero_interior: Número interior de la dirección (opcional).
     """
+    _afirmativos = ["sí", "si", "correcto", "así es", "asi es", "exacto", "afirmativo", "sí señor", "si señor", "sí señora", "si señora", "claro", "sí así", "si asi"]
+    if not any(word in respuesta_confirmacion.lower() for word in _afirmativos):
+        return (
+            f"El cliente no confirmó los datos — respondió: '{respuesta_confirmacion}'. "
+            "Repite la pregunta de confirmación: 'Tengo: [calle y número], municipio [municipio], colonia [colonia]. ¿Es correcto?' "
+            "y espera que el cliente diga explícitamente 'Sí' o 'Correcto' antes de llamar esta herramienta."
+        )
+
     logger.info("Revisando cobertura en %s %s, %s, %s, %s, %s", calle, numero, colonia, municipio, codigo_postal or "no proporcionado", numero_interior or "no proporcionado")
 
     # Filler + HTTP en PARALELO (optimización de latencia).
@@ -210,7 +221,7 @@ async def revisar_cobertura(
                     if intento >= 3:
                         return (
                             "No fue posible validar el domicilio tras tres intentos. "
-                            "Informa al cliente que lo transferirás con un asesor y luego usa transferencia_llamada_warm."
+                            "CALL 'transferencia_llamada_warm' sin decir nada antes — la herramienta se encarga del mensaje al cliente."
                         )
                     return inner["resultado"]
                 if first.get("hay_cobertura"):
@@ -223,6 +234,13 @@ async def revisar_cobertura(
     finally:
         # Asegura que el filler terminó de sonar antes de devolver el resultado al LLM.
         await handle.wait_for_playout()
+
+
+def _folio_en_pares(folio) -> str:
+    s = str(folio)
+    start = len(s) % 2
+    pairs = ([s[0]] if start else []) + [s[i:i+2] for i in range(start, len(s), 2)]
+    return ", ".join(pairs)
 
 
 @function_tool()
@@ -253,11 +271,6 @@ async def generar_prospecto(
         return ""
     context.userdata["_prospecto_en_progreso"] = True
     logger.info("Generando prospecto: %s %s – %s", nombre, apellido, celular)
-
-    # Filler + HTTP en PARALELO. Ver comentario completo en revisar_cobertura.
-    handle = await context.session.generate_reply(
-        instructions="Dile al cliente exactamente: 'Un momento por favor, en lo que te registro en el sistema.'"
-    )
 
     room = context.userdata.get("_room")
     payload = {
@@ -305,7 +318,10 @@ async def generar_prospecto(
                 if prospecto_id:
                     context.userdata["ticket_id"] = str(prospecto_id)
                     asyncio.create_task(_send_whatsapp_contratacion(celular))
-                    return f"Prospecto registrado exitosamente. El folio de registro es {prospecto_id}."
+                    return (
+                        f"Prospecto registrado exitosamente. El folio de registro es {prospecto_id}. "
+                        f"Díselo al cliente en pares: {_folio_en_pares(prospecto_id)}."
+                    )
                 logger.warning("Unexpected API response format: %s", data)
                 return "Prospecto registrado exitosamente."
 
@@ -313,9 +329,6 @@ async def generar_prospecto(
         logger.error("Error generando prospecto: %s", exc)
         context.userdata["_prospecto_en_progreso"] = False
         return "El servicio de registro no está disponible temporalmente."
-    finally:
-        # Asegura que el filler terminó de sonar antes de devolver el resultado al LLM.
-        await handle.wait_for_playout()
 
 
 @function_tool()
@@ -346,11 +359,6 @@ async def generar_prospecto_perdida(
         return ""
     context.userdata["_prospecto_perdida_en_progreso"] = True
     logger.info("Generando prospecto de perdida: %s %s – %s", nombre, apellido, celular)
-
-    # Filler + HTTP en PARALELO. Ver comentario completo en revisar_cobertura.
-    handle = await context.session.generate_reply(
-        instructions="Dile al cliente exactamente: 'Un momento por favor, registrare que no hay cobertura en tu zona, esperemamos llegar pronto.'"
-    )
 
     room = context.userdata.get("_room")
     payload = {
@@ -397,16 +405,16 @@ async def generar_prospecto_perdida(
 
                 if prospecto_id:
                     context.userdata["ticket_id"] = str(prospecto_id)
-                    return f"Prospecto registrado exitosamente. El folio de registro es {prospecto_id}."
+                    return (
+                        f"Prospecto registrado exitosamente. El folio de registro es {prospecto_id}. "
+                        f"Díselo al cliente en pares: {_folio_en_pares(prospecto_id)}."
+                    )
                 logger.warning("Unexpected API response format: %s", data)
                 return "Prospecto registrado exitosamente."
 
     except Exception as exc:
         logger.error("Error generando prospecto: %s", exc)
         return "El servicio de registro no está disponible temporalmente."
-    finally:
-        # Asegura que el filler terminó de sonar antes de devolver el resultado al LLM.
-        await handle.wait_for_playout()
 
 async def _fetch_evento_zona(id_cliente: str, call_id: str | None = None) -> str:
     """Consulta el endpoint de eventos y devuelve el resultado como string para el prompt."""
@@ -663,11 +671,10 @@ async def generar_ticket_soporte(
     if context.userdata.get("_ticket_en_progreso"):
         return ""
     context.userdata["_ticket_en_progreso"] = True
+    stored_id = context.userdata.get("cliente_data", {}).get("id", "")
+    if stored_id:
+        id_cliente = str(stored_id)
     logger.info("Generando ticket de soporte: %s %s ", id_cliente, detalle)
-
-    handle = await context.session.generate_reply(
-        instructions="Dile al cliente exactamente: 'Un momento por favor, en lo que registro tu problema en el sistema.'"
-    )
 
     room = context.userdata.get("_room")
     payload = {
@@ -696,24 +703,118 @@ async def generar_ticket_soporte(
                 data = await resp.json()
                 logger.info("Ticket API response: %s", data)
 
-                response_msg = data.get("response", "")
-                ticket_id = data.get("id", "")
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                if isinstance(data, dict) and isinstance(data.get("data"), str):
+                    try:
+                        data = json.loads(data["data"])
+                    except Exception:
+                        pass
+
+                ticket_id = data.get("id", "") if isinstance(data, dict) else ""
 
                 if ticket_id:
                     context.userdata["ticket_id"] = str(ticket_id)
-                    return f"Ticket registrado exitosamente con ID {ticket_id}."
-                elif response_msg and "exitosamente" in response_msg.lower():
-                    return "Ticket registrado exitosamente."
-                else:
-                    logger.warning("Unexpected API response format: %s", data)
-                    return f"Respuesta del sistema: {response_msg or 'Registro completado'}"
+                    return (
+                        f"Ticket registrado exitosamente. El folio de seguimiento es {ticket_id}. "
+                        f"Díselo al cliente en pares: {_folio_en_pares(ticket_id)}."
+                    )
+                logger.warning("Unexpected API response format: %s", data)
+                return "Ticket registrado exitosamente."
 
     except Exception as exc:
         logger.error("Error generando ticket: %s", exc)
         return "El servicio de registro no está disponible temporalmente."
-    finally:
-        # Asegura que el filler terminó de sonar antes de devolver el resultado al LLM.
-        await handle.wait_for_playout()
+
+
+@function_tool()
+async def generar_ticket_soporte_fuera_horario(
+    context: RunContext,
+    numero_telefono: str,
+    nombre_cliente: str,
+    detalle_intento_transferencia: str,
+) -> str:
+    """Registra un ticket de soporte fuera del horario laboral cuando el cliente intentó
+    hablar con un asesor humano pero no fue posible por estar fuera de horario.
+    Usa esta herramienta cuando el cliente acepte dejar sus datos para seguimiento.
+    IMPORTANTE: Antes de llamar esta herramienta SIEMPRE debes:
+    1. Pedir al cliente su nombre completo.
+    2. Pedir su número de teléfono a 10 dígitos y confirmarlo repitiéndolo en pares.
+       Ejemplo: "Tengo treinta y tres, noventa y cuatro, cero cero, ochenta y cuatro — ¿es correcto?"
+       Si el cliente corrige algún dígito, actualiza y confirma de nuevo antes de continuar.
+    NUNCA uses datos del contexto ni inventes información.
+
+    Args:
+        numero_telefono: Número de teléfono a 10 dígitos confirmado por el cliente.
+        nombre_cliente: Nombre completo proporcionado por el cliente en esta conversación.
+        detalle_intento_transferencia: Motivo por el que el cliente quería hablar con un asesor.
+    """
+    if context.userdata.get("_ticket_fuera_horario_en_progreso"):
+        return ""
+
+    digits = "".join(c for c in str(numero_telefono) if c.isdigit())
+    if len(digits) != 10:
+        return (
+            f"El número de teléfono '{numero_telefono}' no tiene 10 dígitos ({len(digits)} dígitos). "
+            "Pide al cliente que repita su número completo a 10 dígitos y confírmalo en pares antes de continuar."
+        )
+
+    context.userdata["_ticket_fuera_horario_en_progreso"] = True
+    logger.info(
+        "Generando ticket fuera de horario: %s %s", nombre_cliente, numero_telefono
+    )
+
+    room = context.userdata.get("_room")
+    payload = {
+        "call_id": room.name if room else None,
+        "numero_telefono": numero_telefono,
+        "nombre_cliente": nombre_cliente,
+        "detalle_intento_transferencia": detalle_intento_transferencia,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                "https://lab.conbiz.ai/webhook/ticket-soporte-fuera-horario",
+                json=payload,
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("Ticket fuera horario API status %s", resp.status)
+                    return "No pude registrar la solicitud, intenta más tarde."
+
+                data = await resp.json()
+                logger.info("Ticket fuera horario API response: %s", data)
+
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                if isinstance(data, dict) and isinstance(data.get("data"), str):
+                    try:
+                        data = json.loads(data["data"])
+                    except Exception:
+                        pass
+
+                ticket_id = data.get("id", "") if isinstance(data, dict) else ""
+
+                if ticket_id:
+                    context.userdata["ticket_id"] = str(ticket_id)
+                    return (
+                        f"Ticket registrado exitosamente. El folio de seguimiento es {ticket_id}. "
+                        "Un asesor se comunicará en horario laboral (lunes a viernes 9 AM - 6 PM)."
+                    )
+                logger.warning("Unexpected API response format: %s", data)
+                return (
+                    "Datos registrados exitosamente. "
+                    "Un asesor se comunicará en horario laboral (lunes a viernes 9 AM - 6 PM)."
+                )
+
+    except Exception as exc:
+        logger.error("Error generando ticket fuera de horario: %s", exc)
+        return "El servicio de registro no está disponible temporalmente."
 
 
 async def _send_whatsapp_contratacion(numero: str) -> None:
@@ -784,11 +885,30 @@ async def transferencia_llamada(context: RunContext) -> str:
 # ============================================================================
 
 # Número de destino para warm transfer.
-WARM_TRANSFER_PHONE = "523347777474"
+WARM_TRANSFER_PHONE = "523379797979"
 # ID del trunk saliente configurado en LiveKit Cloud.
 WARM_TRANSFER_TRUNK_ID = "ST_oTqtm7RzK7k6"
 # Número que verá el asesor cuando Sofia le llame (caller ID).
 WARM_TRANSFER_SIP_NUMBER = "523321012739"
+
+
+async def _warm_transfer_watchdog(human_room_name: str, timeout: int = 300) -> None:
+    try:
+        await asyncio.sleep(timeout)
+        logger.warning(
+            "Warm transfer timeout (%ss): eliminando sala %s", timeout, human_room_name
+        )
+        from livekit.agents.job import get_job_context
+        job_ctx = get_job_context()
+        await job_ctx.api.room.delete_room(
+            api.DeleteRoomRequest(room=human_room_name)
+        )
+        logger.info("Sala %s eliminada por timeout de warm transfer.", human_room_name)
+    except asyncio.CancelledError:
+        logger.info("Watchdog warm transfer cancelado (transfer completado a tiempo).")
+        raise
+    except Exception as exc:
+        logger.error("Error en watchdog warm transfer: %s", exc)
 
 
 @function_tool()
@@ -796,6 +916,17 @@ async def transferencia_llamada_warm(context: RunContext) -> str:
     """Transfiere la llamada a un agente humano (warm transfer).
     Usa esta herramienta cuando necesites transferir al cliente con un asesor.
     """
+    ahora = datetime.now(ZoneInfo("America/Mexico_City"))
+    if ahora.weekday() >= 5 or not (9 <= ahora.hour < 18):
+        return (
+            "FUERA DE HORARIO: Los asesores humanos no están disponibles en este momento. "
+            "Informa al cliente que el horario de atención es de lunes a viernes de 9 AM a 6 PM hora de Ciudad de México. "
+            "Ofrécele registrar sus datos para que un asesor le contacte: si acepta, "
+            "pídele PRIMERO su nombre completo y LUEGO su número de teléfono a 10 dígitos — "
+            "NUNCA uses datos del contexto ni inventes información. "
+            "Solo después de tener ambos datos confirmados por el cliente, "
+            "LLAMA a generar_ticket_soporte_fuera_horario."
+        )
     logger.info("Iniciando warm transfer a %s (trunk: %s)", WARM_TRANSFER_PHONE, WARM_TRANSFER_TRUNK_ID)
     handle = await context.session.generate_reply(
         instructions=(
@@ -805,6 +936,7 @@ async def transferencia_llamada_warm(context: RunContext) -> str:
         )
     )
     await handle.wait_for_playout()
+    await asyncio.sleep(2)
     context.userdata["razon_finalizacion"] = "llamada transferida"
     context.userdata["llamada_transferida"] = True
 
@@ -819,19 +951,29 @@ async def transferencia_llamada_warm(context: RunContext) -> str:
         "Cuando el asesor confirme que está listo para atender al cliente, usa connect_to_caller."
     )
 
+    caller_room = context.userdata.get("_room")
+    human_room_name = f"{caller_room.name}-human-agent" if caller_room else "unknown-human-agent"
+    watchdog_task = asyncio.create_task(
+        _warm_transfer_watchdog(human_room_name, timeout=300)
+    )
+
+    caller_number = context.userdata.get("sip_celular_norm") or WARM_TRANSFER_SIP_NUMBER
     try:
         result = await WarmTransferTask(
             sip_call_to=WARM_TRANSFER_PHONE,
             sip_trunk_id=WARM_TRANSFER_TRUNK_ID,
-            sip_number=WARM_TRANSFER_SIP_NUMBER,
+            sip_number=caller_number,
             extra_instructions=extra,
         )
+        watchdog_task.cancel()
         logger.info("Warm transfer exitoso: %s", result.human_agent_identity)
         handle2 = await context.session.generate_reply(
             instructions="Informa al cliente brevemente que ya lo conectaste con el asesor y despídete."
         )
         await handle2.wait_for_playout()
     except (ToolError, Exception) as exc:
+        if not watchdog_task.done():
+            watchdog_task.cancel()
         logger.error("Warm transfer fallido: %s", exc)
         handle2 = await context.session.generate_reply(
             instructions=(
@@ -1016,7 +1158,7 @@ class AgenteSoporte(Agent):
             "  6.1. Pregunta si después del reinicio el servicio ya funciona."
             "  6.2. Si quedó resuelto, confirma brevemente que el servicio volvió y ofrece ayuda adicional."
             "  6.3. Si no quedó resuelto, explica que se requiere revisión adicional, dile al cliente 'Dame unos momentos para registrar tu problema en el sistema' y ejecuta generar_ticket_soporte"
-            "  6.4. Informa al cliente que ya registraste su ticket de soporte hazle saber su folio de seguimiento (id de ticket), despidete amablemente y usa endCall"
+            "  6.4. Informa al cliente que ya registraste su ticket de soporte, dile su folio de seguimiento EN PARES de dígitos exactamente como lo indica el sistema (ejemplo: '77, 45' se dice 'setenta y siete, cuarenta y cinco'; '1, 23, 45' se dice 'uno, veintitrés, cuarenta y cinco'), despídete amablemente y usa endCall"
             "8. Si el cliente ya tiene un ticket abierto y pide seguimiento, reprogramación o estatus de visita, "
             "no hagas troubleshooting prolongado; usa endCall."
 
@@ -1043,8 +1185,8 @@ class AgenteSoporte(Agent):
 
             "## Solicitudes administrativas (transferencia inmediata)"
             "Si en CUALQUIER momento de la conversación el cliente menciona cualquiera de estos temas, "
-            "DETÉN el flujo técnico de inmediato, informa al cliente con empatía que para ese tipo de solicitudes "
-            "necesitas transferirlo con uno de nuestros asesores, y usa transferencia_llamada_warm:"
+            "DETÉN el flujo técnico de inmediato y CALL 'transferencia_llamada_warm' sin decir nada antes en ese turno — "
+            "la herramienta se encarga del mensaje al cliente:"
             "- cambio de contraseña (de su cuenta, correo, o del Wi-Fi)"
             "- baja de servicio (cancelación del contrato)"
             "- cambio de domicilio (cambio de dirección del servicio)"
@@ -1055,7 +1197,7 @@ class AgenteSoporte(Agent):
             "CALL inmediatamente 'handoff_to_AgenteProspecto' sin decir nada en ese turno."
 
             "## Escalamiento"
-            "Usa transferencia_llamada_warm si ocurre cualquiera de estos casos que requieren un agente humano:"
+            "CALL 'transferencia_llamada_warm' sin decir nada antes en ese turno si ocurre cualquiera de estos casos:"
             "- cliente solicita cambio de contraseña, baja de servicio o cambio de domicilio\n"
             "- cliente pide hablar con un humano\n"
             "Usa endCall si el caso se puede cerrar sin transferir:"
@@ -1079,7 +1221,7 @@ class AgenteSoporte(Agent):
         super().__init__(
             instructions=_instructions,
             chat_ctx=chat_ctx,
-            tools=[end_call, reiniciar_router, generar_ticket_soporte, transferencia_llamada_warm],
+            tools=[end_call, reiniciar_router, generar_ticket_soporte, transferencia_llamada_warm, generar_ticket_soporte_fuera_horario],
         )
 
     @function_tool()
@@ -1143,6 +1285,7 @@ class AgenteSoporte(Agent):
             n = name.strip()
             return (
                 n.endswith("end_call")
+                or n.endswith("transferencia_llamada_warm")
                 or n.endswith("handoff_to_AgenteProspecto")
                 or n.endswith("handoff_to_AgenteInformacion")
             )
@@ -1185,13 +1328,13 @@ class AgenteProspecto(Agent):
                 Nunca incluyas, repitas o hagas referencia a información previamente proporcionada por el cliente dentro de la siguiente pregunta. Las preguntas deben ser cortas, directas y sin contexto acumulado.
                 Utiliza EXACTAMENTE las siguientes preguntas y en el siguiente orden:
 
-                2.1. 'Proporcióname tu calle y número' (elimina los espacios entre números para utilizar el número completo - puede ser de 1 a 5 dígitos)
+                2.1. 'Proporcióname tu calle y número' (el número exterior SIEMPRE debe pasarse en dígitos — convierte cualquier número en texto a su forma numérica, ej: "ciento veintiocho" → "128")
                 2.2. '¿Tiene numero interior?' (si no tiene, continuar)
                 2.3. '¿En qué municipio?'
                 2.4. '¿En qué colonia?'
                 2.5. '¿Se sabe el código postal?' (a 5 dígitos - si el cliente no se lo sabe, continuar)
-                2.6. Confirma con el cliente los datos recopilados diciendo exactamente: "Tengo: [calle y número], municipio [municipio], colonia [colonia]. ¿Es correcto?" — si el cliente corrige algún dato, actualízalo antes de continuar.
-                2.7. CALL de manera MANDATORIA 'revisar_cobertura' y esperar respuesta.
+                2.6. OBLIGATORIO — NUNCA omitas este paso: Confirma con el cliente los datos recopilados diciendo exactamente: "Tengo: [calle y número], municipio [municipio], colonia [colonia]. ¿Es correcto?" — si el cliente corrige algún dato, actualízalo y repite la confirmación. NUNCA llames revisar_cobertura sin que el cliente haya confirmado los datos.
+                2.7. Solo después de que el cliente confirme que los datos son correctos, CALL de manera MANDATORIA 'revisar_cobertura' y esperar respuesta.
 
                 3. Después de recibir respuesta de la herramienta:
 
@@ -1204,7 +1347,7 @@ class AgenteProspecto(Agent):
                         3.2.1. Dar una explicación con empatía y claridad. Menciona que Obbi sigue trabajando para seguir expandiendo en su zona.
                         3.2.2. No ofrezcas paquetes como si sí hubiera disponibilidad.
                         3.2.3. SAY 'Puedo tomar tus datos para generar una solicitud de cobertura y avisarte en cuanto haya servicio en tu domicilio, ¿te parece bien?'. y esperar respuesta.
-                        3.2.4. IF el cliente quiere dejar sus datos para seguimiento, ejecuta generar_prospecto_perdida con los datos que tengas y los que puedas recopilar de forma natural. Después de registrar, dile al cliente su folio de registro (el ID que devuelve el sistema).
+                        3.2.4. IF el cliente quiere dejar sus datos para seguimiento, ejecuta generar_prospecto_perdida con los datos que tengas y los que puedas recopilar de forma natural. Después de registrar, dile al cliente su folio de registro EN PARES de dígitos exactamente como lo indica el sistema (ejemplo: '39, 34' se dice 'treinta y nueve, treinta y cuatro'; '1, 23, 45' se dice 'uno, veintitrés, cuarenta y cinco').
                 3.3. IF 'revisar_cobertura' no devuelve una dirección suficientemente exacta:
                         3.3.1. Pide al cliente repetir calle, número, colonia y municipio.
                         3.3.2. Confirma nuevamente los datos antes de llamar la herramienta (igual que paso 2.6).
@@ -1221,7 +1364,7 @@ class AgenteProspecto(Agent):
                         4.2.4. Pregunta si tiene alguna preferencia de horario para la instalación o algún detalle adicional que quiera agregar.
                         4.2.5. Confirma 1 sola vez todos los datos recopilados con el cliente antes de proceder.
                         4.2.6. Una vez confirmados, construye el campo 'detalle' con el siguiente formato exacto: "Paquete: [nombre del paquete elegido]  Notas: [preferencia de horario u observaciones del cliente]". Si el cliente no indicó ninguna nota o preferencia, usa "Sin notas". CALL 'generar_prospecto' con todos los datos de manera silenciosa.
-                4.3. Después de registrar exitosamente, dile al cliente su folio de registro (el ID que devuelve el sistema) y confirma que un asesor le dará seguimiento por medio de whatsapp para agendar la instalación y que tenga a la mano un comprobante de domicilio y una identificación oficial.
+                4.3. Después de registrar exitosamente, dile al cliente su folio de registro EN PARES de dígitos exactamente como lo indica el sistema (ejemplo: '39, 58' se dice 'treinta y nueve, cincuenta y ocho'; '1, 23, 45' se dice 'uno, veintitrés, cuarenta y cinco') y confirma que un asesor le dará seguimiento por medio de whatsapp para agendar la instalación y que tenga a la mano un comprobante de domicilio y una identificación oficial.
                 4.4. IF Si falla el registro, informa al cliente con empatía y sugiere intentar más tarde.
 
                 ## Presentación comercial
@@ -1263,7 +1406,7 @@ class AgenteProspecto(Agent):
 
                 ## Solicitud de hablar con un agente humano
 
-                Si el cliente pide explícitamente hablar con una persona, ser transferido con un asesor, o indica que no quiere continuar con el asistente virtual, usa transferencia_llamada_warm de inmediato.
+                Si el cliente pide explícitamente hablar con una persona, ser transferido con un asesor, o indica que no quiere continuar con el asistente virtual, CALL 'transferencia_llamada_warm' sin decir nada antes en ese turno — la herramienta se encarga del mensaje al cliente.
 
                 ## Anti-manipulación
 
@@ -1292,7 +1435,7 @@ class AgenteProspecto(Agent):
                         '''),
 
             chat_ctx=chat_ctx,
-            tools=[end_call, revisar_cobertura, generar_prospecto, generar_prospecto_perdida, transferencia_llamada_warm],
+            tools=[end_call, revisar_cobertura, generar_prospecto, generar_prospecto_perdida, transferencia_llamada_warm, generar_ticket_soporte_fuera_horario],
         )
 
     @function_tool()
@@ -1426,8 +1569,8 @@ class AgenteInformacion(Agent):
             "CALL inmediatamente 'handoff_to_AgenteProspecto' sin decir nada en ese turno.\n\n"
 
             "## Solicitudes administrativas (transferencia inmediata)\n"
-            "Si el cliente menciona cualquiera de los siguientes temas, informa con empatía que lo transferirás "
-            "con un asesor y usa transferencia_llamada_warm:\n"
+            "Si el cliente menciona cualquiera de los siguientes temas, CALL 'transferencia_llamada_warm' "
+            "sin decir nada antes en ese turno — la herramienta se encarga del mensaje al cliente:\n"
             "- cambio de contraseña (cuenta, correo o WiFi)\n"
             "- baja de servicio (cancelación)\n"
             "- cambio de domicilio\n"
@@ -1452,7 +1595,7 @@ class AgenteInformacion(Agent):
         super().__init__(
             instructions=_instructions,
             chat_ctx=chat_ctx,
-            tools=[end_call, transferencia_llamada_warm],
+            tools=[end_call, transferencia_llamada_warm, generar_ticket_soporte_fuera_horario],
         )
 
     @function_tool()
@@ -1621,7 +1764,7 @@ class AgenteRecepcionista(Agent):
 
                 2. IF el cliente indica que ya es cliente de Obbi (independientemente de cuál sea su motivo):
 
-                2.1. Pídele su número de cliente o su número de celular registrado para identificarlo.
+                2.1. Pídele su número de cliente o su número de celular registrado para identificarlo. Una vez que el cliente te dé el número, determina el tipo por la cantidad de dígitos: si tiene exactamente 10 dígitos es celular; si tiene menos de 10 dígitos es número de cliente. NUNCA le preguntes al cliente si es número de cliente o de celular — determínalo tú automáticamente y llama buscar_cliente de inmediato.
                 2.2. CALL buscar_cliente con el dato proporcionado.
                 2.3. IF se encuentra información del cliente, di: ‘Tengo registrada la cuenta a nombre de [nombre del titular], ¿me comunico con el titular o con quién tengo el gusto?’ (NUNCA menciones el número de ID ni el número de cliente). Si el cliente confirma ser el titular, continúa normalmente usando su nombre. Si indica ser otra persona, toma su nombre y úsalo durante el resto de la conversación.
                      2.3.1. Una vez confirmada la identidad, identifica la intención del cliente y GOTO el paso 4 o 5 según corresponda.
@@ -1639,7 +1782,7 @@ class AgenteRecepcionista(Agent):
 
                 4.2.1. CALL inmediatamente ‘handoff_to_AgenteInformacion’ sin decir nada más en ese turno (ni antes ni después de la herramienta).
 
-                5. IF la intención es cualquiera de los siguientes casos: cambio de contraseña (de cuenta, correo o WiFi), baja de servicio (cancelación), cambio de domicilio, seguimiento de visita técnica o hablar con una persona: informa al cliente con empatía que para ese tipo de solicitudes lo vas a transferir con un asesor, y CALL ‘transferencia_llamada_warm’. NO hagas handoff_to_AgenteSoporte para estos casos.
+                5. IF la intención es cualquiera de los siguientes casos: cambio de contraseña (de cuenta, correo o WiFi), baja de servicio (cancelación), cambio de domicilio, seguimiento de visita técnica o hablar con una persona: CALL ‘transferencia_llamada_warm’ sin decir nada antes en ese turno — la herramienta se encarga del mensaje al cliente. NO hagas handoff_to_AgenteSoporte para estos casos.
 
                 6. IF Si la intención no está clara, haz una sola pregunta breve para aclarar.
 
@@ -1687,7 +1830,7 @@ class AgenteRecepcionista(Agent):
                 - [CALL │ Ejecutar herramienta en silencio]
                 - [AND | une múltiples condiciones que deben cumplirse].
             '''),
-            tools=[end_call, buscar_cliente, transferencia_llamada_warm],
+            tools=[end_call, buscar_cliente, transferencia_llamada_warm, generar_ticket_soporte_fuera_horario],
         )
 
     async def llm_node(
@@ -1890,19 +2033,6 @@ async def entrypoint(ctx: JobContext):
         ),
         tts=tts.FallbackAdapter(
             [
-                # Principal: ElevenLabs API directa (ELEVEN_API_KEY en secrets.env local o secret en LiveKit Cloud).
-                # Docs: https://docs.livekit.io/agents/models/tts/plugins/elevenlabs/
-                #elevenlabs.TTS(
-                #    model="eleven_turbo_v2_5",
-                #    voice_id="spPXlKT5a4JMfbhPRAzA",
-                #    language="es",
-                #    voice_settings=elevenlabs.VoiceSettings(
-                #        stability=0.35,
-                #        similarity_boost=0.9,
-                #        style=0.7,
-                #        speed=1.0,
-                #    ),
-                #),
                 inference.TTS(
                     model="cartesia/sonic-3",
                     voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
@@ -2042,10 +2172,10 @@ async def entrypoint(ctx: JobContext):
     await background_audio.start(room=ctx.room, agent_session=session)
 
     async def _max_duration_watchdog():
-        await asyncio.sleep(360)  # 6 minutos
+        await asyncio.sleep(600)  # 10 minutos
         if session.userdata.get("razon_finalizacion", "indefinido") != "indefinido":
             return
-        logger.info("Llamada alcanzó duración máxima de 6 minutos, cerrando sesión.")
+        logger.info("Llamada alcanzó duración máxima de 10 minutos, cerrando sesión.")
         session.userdata["razon_finalizacion"] = "duracion_maxima"
         try:
             handle = await session.generate_reply(
