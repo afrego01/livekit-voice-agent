@@ -34,9 +34,9 @@ from livekit.agents import (
     TurnHandlingOptions
 )
 from livekit.plugins import elevenlabs, noise_cancellation, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents.llm import function_tool, ToolError
 from livekit.agents.beta.workflows import WarmTransferTask
+from livekit.agents.types import APIConnectOptions
 
 
 # EndCallTool es una herramienta built-in de LiveKit que termina la llamada.
@@ -152,6 +152,7 @@ async def revisar_cobertura(
     numero: str,
     colonia: str,
     municipio: str,
+    respuesta_confirmacion: str,
     codigo_postal: str | None = None,
     numero_interior: str | None = None,
 ) -> str:
@@ -164,9 +165,18 @@ async def revisar_cobertura(
         numero: Número exterior de la dirección SIEMPRE en dígitos (ej: "128", nunca "ciento veintiocho"). Convierte cualquier número en texto a su forma numérica antes de pasar este argumento.
         colonia: Nombre de la colonia o fraccionamiento.
         municipio: Municipio o delegación.
+        respuesta_confirmacion: Exactamente lo que dijo el cliente al confirmar los datos (ej: "Sí", "Correcto", "Así es"). NUNCA pases "Sigo aquí", "Ok", "Gracias" ni respuestas que no sean una confirmación explícita de los datos.
         codigo_postal: Código postal (opcional a 5 dígitos).
         numero_interior: Número interior de la dirección (opcional).
     """
+    _afirmativos = ["sí", "si", "correcto", "así es", "asi es", "exacto", "afirmativo", "sí señor", "si señor", "sí señora", "si señora", "claro", "sí así", "si asi"]
+    if not any(word in respuesta_confirmacion.lower() for word in _afirmativos):
+        return (
+            f"El cliente no confirmó los datos — respondió: '{respuesta_confirmacion}'. "
+            "Repite la pregunta de confirmación: 'Tengo: [calle y número], municipio [municipio], colonia [colonia]. ¿Es correcto?' "
+            "y espera que el cliente diga explícitamente 'Sí' o 'Correcto' antes de llamar esta herramienta."
+        )
+
     logger.info("Revisando cobertura en %s %s, %s, %s, %s, %s", calle, numero, colonia, municipio, codigo_postal or "no proporcionado", numero_interior or "no proporcionado")
 
     # Filler + HTTP en PARALELO (optimización de latencia).
@@ -218,7 +228,7 @@ async def revisar_cobertura(
                     if intento >= 3:
                         return (
                             "No fue posible validar el domicilio tras tres intentos. "
-                            "[CALL] 'transferencia_llamada_warm' sin decir nada antes — la herramienta se encarga del mensaje al cliente."
+                            "CALL 'transferencia_llamada_warm' sin decir nada antes — la herramienta se encarga del mensaje al cliente."
                         )
                     return inner["resultado"]
                 if first.get("hay_cobertura"):
@@ -1666,6 +1676,48 @@ class AgenteRecepcionista(Agent):
 # PUNTO DE ENTRADA (ENTRYPOINT)
 # ============================================================================
 
+_ELEVENLABS_WARMUP_CONN = APIConnectOptions(max_retry=1, timeout=15.0, retry_interval=1.0)
+
+
+def _build_elevenlabs_tts() -> elevenlabs.TTS:
+    # El acento depende del voice_id: debe ser una voz español/MX de la biblioteca ElevenLabs.
+    # language="es" solo aplica con eleven_turbo_v2_5 (se envía como language_code en el WebSocket).
+    # Fallback Cartesia (Daniela) ya es es-MX nativa si ElevenLabs falla.
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "ewn5JTa3lNPY8QVuZJi6")
+    return elevenlabs.TTS(
+        model="eleven_turbo_v2_5",
+        voice_id=voice_id,
+        language="es",
+        apply_text_normalization="on",
+        voice_settings=elevenlabs.VoiceSettings(
+            stability=0.30,
+            similarity_boost=0.9,
+            style=0.70,
+            speed=1.0,
+        ),
+    )
+
+
+async def _warmup_elevenlabs_tts(el_tts: elevenlabs.TTS) -> None:
+    """Abre el WebSocket de ElevenLabs antes del primer turno.
+
+    El plugin no implementa prewarm(); en cold start la primera síntesis tarda
+    varios segundos y el FallbackAdapter marca ElevenLabs como no disponible.
+    """
+    try:
+        _, acquire_time, reused = await asyncio.wait_for(
+            el_tts._current_connection(),
+            timeout=_ELEVENLABS_WARMUP_CONN.timeout,
+        )
+        logger.info(
+            "ElevenLabs TTS precalentado (%.0fms, reused=%s)",
+            acquire_time * 1000,
+            reused,
+        )
+    except Exception as exc:
+        logger.warning("ElevenLabs warmup falló: %s", exc)
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
@@ -1696,6 +1748,26 @@ async def entrypoint(ctx: JobContext):
 
     identificado_por_sip = bool(initial_userdata.get("identificado_por_sip"))
 
+    eleven_tts = _build_elevenlabs_tts()
+    tts_engine = tts.FallbackAdapter(
+        [
+            # Principal: ElevenLabs (ELEVEN_API_KEY en secrets.env o lk agent update-secrets).
+            eleven_tts,
+            # Fallback: Cartesia vía LiveKit Inference (sin API key de Cartesia).
+            inference.TTS(
+                model="cartesia/sonic-3",
+                voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
+                language="es",
+                extra_kwargs={
+                    "speed": 0.90,
+                    "volume": 1.0,
+                },
+            ),
+        ],
+        max_retry_per_tts=3,
+    )
+    await _warmup_elevenlabs_tts(eleven_tts)
+
     session = AgentSession(
         userdata=initial_userdata,
 
@@ -1708,66 +1780,16 @@ async def entrypoint(ctx: JobContext):
                         "keyterm": [
                             "Obbi",
                             "Tlajomulco",
-                            "Tlajomulco de Zúñiga",
                             "Zúñiga",
                             "Villa Fontana Aqua",
-                            "Valle de Tejeda",
-                            "Mar del Norte",
-                            "Lago Victoria",
-                            "Maracaibo",
-                            "Valle de Sangoné",
-                            "Sangoné",
-                            "Coto",
-                            "edificio",
-                            "buzón",
-                            "particular",
-                            "robaron",
-                            "recibo",
-                            "cuatrocientos",
-                            "Permítame",
-                            "credencial",
                             "Albazur",
                             "fibra óptica",
-                            "Pontevedra",
-                            "domicilio aparte",
-                            "fraccionamiento",
-                            "privada",
-                            "andador",
-                            "manzana",
-                            "lote",
-                            "departamento",
-                            "planta baja",
-                            "primer piso",
-                            "segundo piso",
-                            "entre calles",
-                            "esquina",
-                            "referencia",
-                            "número de casa",
-                            "número de lote",
-                            "checar",
-                            "reportar",
-                            "contraseña",
-                            "WiFi",
-                            "ingresar",
-                            "procedimiento",
-                            "conexión",
-                            "agente real",
-                            "pagando",
-                            "cansado",
-                            "robando",
-                            "señal",
-                            "lento",
-                            "intermitente",
-                            "reiniciar",
-                            "router",
-                            "módem",
-                            "técnico",
-                            "visita técnica",
-                            "seguro",
-                            "servicio",
+                            "ONU",
+                            "CPE",
                         ],
+                        "language_hint": "es",
                         "eager_eot_threshold": 0.6,
-                        "eot_threshold": 0.7,
+                        "eot_threshold": 0.85,
                     },
                 ),
                 inference.STT(
@@ -1787,19 +1809,7 @@ async def entrypoint(ctx: JobContext):
             ]
         ),
 
-        tts=tts.FallbackAdapter(
-            [
-                inference.TTS(
-                    model="cartesia/sonic-3",
-                    voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
-                    language="es",
-                    extra_kwargs={
-                        "speed": 0.90,
-                        "volume": 1.0,
-                    },
-                ),
-            ]
-        ),
+        tts=tts_engine,
 
         vad=silero.VAD.load(),
 

@@ -36,6 +36,7 @@ from livekit.agents import (
 from livekit.plugins import elevenlabs, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents.llm import function_tool, ToolError
+from livekit.agents.types import APIConnectOptions
 from livekit.agents.beta.workflows import WarmTransferTask
 
 
@@ -1666,6 +1667,40 @@ class AgenteRecepcionista(Agent):
 # PUNTO DE ENTRADA (ENTRYPOINT)
 # ============================================================================
 
+_ELEVENLABS_WARMUP_CONN = APIConnectOptions(max_retry=1, timeout=15.0, retry_interval=1.0)
+
+
+def _build_elevenlabs_tts() -> elevenlabs.TTS:
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "ewn5JTa3lNPY8QVuZJi6")
+    return elevenlabs.TTS(
+        model="eleven_turbo_v2_5",
+        voice_id=voice_id,
+        language="es",
+        apply_text_normalization="on",
+        voice_settings=elevenlabs.VoiceSettings(
+            stability=0.30,
+            similarity_boost=0.9,
+            style=0.70,
+            speed=1.0,
+        ),
+    )
+
+
+async def _warmup_elevenlabs_tts(el_tts: elevenlabs.TTS) -> None:
+    try:
+        _, acquire_time, reused = await asyncio.wait_for(
+            el_tts._current_connection(),
+            timeout=_ELEVENLABS_WARMUP_CONN.timeout,
+        )
+        logger.info(
+            "ElevenLabs TTS precalentado (%.0fms, reused=%s)",
+            acquire_time * 1000,
+            reused,
+        )
+    except Exception as exc:
+        logger.warning("ElevenLabs warmup falló: %s", exc)
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
@@ -1695,6 +1730,24 @@ async def entrypoint(ctx: JobContext):
         logger.warning("SIP prefetch omitido: %s", exc)
 
     identificado_por_sip = bool(initial_userdata.get("identificado_por_sip"))
+
+    eleven_tts = _build_elevenlabs_tts()
+    tts_engine = tts.FallbackAdapter(
+        [
+            eleven_tts,
+            inference.TTS(
+                model="cartesia/sonic-3",
+                voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
+                language="es",
+                extra_kwargs={
+                    "speed": 0.90,
+                    "volume": 1.0,
+                },
+            ),
+        ],
+        max_retry_per_tts=3,
+    )
+    await _warmup_elevenlabs_tts(eleven_tts)
 
     session = AgentSession(
         userdata=initial_userdata,
@@ -1787,19 +1840,7 @@ async def entrypoint(ctx: JobContext):
             ]
         ),
 
-        tts=tts.FallbackAdapter(
-            [
-                inference.TTS(
-                    model="cartesia/sonic-3",
-                    voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
-                    language="es",
-                    extra_kwargs={
-                        "speed": 0.90,
-                        "volume": 1.0,
-                    },
-                ),
-            ]
-        ),
+        tts=tts_engine,
 
         vad=silero.VAD.load(),
 
