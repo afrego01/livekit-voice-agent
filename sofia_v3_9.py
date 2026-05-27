@@ -1820,7 +1820,7 @@ async def entrypoint(ctx: JobContext):
                             "servicio",
                         ],
                         "eager_eot_threshold": 0.6,
-                        "eot_threshold": 0.7,
+                        "eot_threshold": 0.85,
                     },
                 ),
                 inference.STT(
