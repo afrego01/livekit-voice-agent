@@ -23,7 +23,7 @@ RUN uv sync --locked
 COPY . .
 
 # change "sofia.py" for the file name you want to deploy on LiveKit cloud
-RUN uv run "sofia_v3_9.py" download-files
+RUN uv run "sofia_v4_0.py" download-files
 
 # --- Production stage ---
 FROM base
@@ -44,4 +44,4 @@ COPY --from=build --chown=appuser:appuser /app /app
 USER appuser
 
 # change "sofia.py" for the file name you want to deploy on LiveKit cloud
-CMD ["uv", "run", "sofia_v3_9.py", "start"]
+CMD ["uv", "run", "sofia_v4_0.py", "start"]

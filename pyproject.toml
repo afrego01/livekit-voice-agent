@@ -10,4 +10,5 @@ dependencies = [
     "livekit-plugins-openai>=1.4.5",
     "python-dotenv>=1.2.2",
     "aiohttp>=3.9",
+    "boto3>=1.43.0",
 ]
