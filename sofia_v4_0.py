@@ -973,6 +973,7 @@ async def transferencia_llamada(context: RunContext) -> str:
 
 # Número de destino para warm transfer.
 WARM_TRANSFER_PHONE = "523379797979"
+#WARM_TRANSFER_PHONE = "523333940084"
 # ID del trunk saliente configurado en LiveKit Cloud.
 WARM_TRANSFER_TRUNK_ID = "ST_oTqtm7RzK7k6"
 # Número que verá el asesor cuando Sofia le llame (caller ID).
@@ -1044,7 +1045,8 @@ async def transferencia_llamada_warm(context: RunContext) -> str:
         _warm_transfer_watchdog(human_room_name, timeout=300)
     )
 
-    caller_number = context.userdata.get("sip_celular_norm") or WARM_TRANSFER_SIP_NUMBER
+    caller_number = WARM_TRANSFER_SIP_NUMBER
+    #caller_number = context.userdata.get("sip_celular_norm") or WARM_TRANSFER_SIP_NUMBER
     try:
         result = await WarmTransferTask(
             sip_call_to=WARM_TRANSFER_PHONE,
