@@ -9,6 +9,7 @@ import aiohttp
 from datetime import datetime
 import boto3
 from zoneinfo import ZoneInfo
+from livekit.plugins import cartesia, noise_cancellation, silero
 
 from dotenv import load_dotenv
 from livekit import api, rtc
@@ -1801,20 +1802,17 @@ async def entrypoint(ctx: JobContext):
     identificado_por_sip = bool(initial_userdata.get("identificado_por_sip"))
 
     eleven_tts = _build_elevenlabs_tts()
-    tts_engine = tts.FallbackAdapter(
-        [
-            eleven_tts,
-            inference.TTS(
-                model="cartesia/sonic-3",
-                voice="5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
-                language="es",
-                extra_kwargs={
-                    "speed": 0.90,
-                    "volume": 1.0,
-                },
-            ),
-        ],
-        max_retry_per_tts=3,
+    tts_engine = cartesia.TTS(
+        api_key=os.getenv("CARTESIA_API_KEY_OBBI"),
+        model="sonic-3.5",
+        language="es",
+        voice=os.getenv("VOICE_ID"),
+        sample_rate=44100,
+        pronunciation_dict_id="pdict_s8NvjVxviRrDg4KmfGTmNS",
+        speed=1.0,
+        volume=1.0,
+        emotion="neutral",
+        api_version="2026-03-01",
     )
     await _warmup_elevenlabs_tts(eleven_tts)
 
