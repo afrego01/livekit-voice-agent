@@ -1064,6 +1064,7 @@ async def transferencia_llamada_warm(context: RunContext) -> str:
         )
         watchdog_task.cancel()
         logger.info("Warm transfer exitoso: %s", result.human_agent_identity)
+        context.userdata["llamada_transferida"] = True
         handle2 = await context.session.generate_reply(
             instructions="Informa al cliente brevemente que ya lo conectaste con el asesor y despídete."
         )
@@ -2051,6 +2052,7 @@ async def entrypoint(ctx: JobContext):
                 "fin": fin_llamada.isoformat(),
                 "duracion_segundos": duracion,
                 "assistant-forwarded-call": bool(ud.get("assistant-forwarded-call", False)),
+                "llamada_transferida": bool(ud.get("llamada_transferida", False)),
                 "ticketID": ud.get("ticket_id"),
             },
             "resumen": {
