@@ -66,6 +66,8 @@ async def end_call(context: RunContext) -> str:
     """Termina la llamada cuando la conversación ha concluido."""
     if context.userdata.get("_end_call_in_progress"):
         return ""
+    room = context.userdata.get("_room")
+    logger.info("end_call invocado (room=%s)", room.name if room else "desconocida")
     context.userdata["_end_call_in_progress"] = True
     context.userdata["razon_finalizacion"] = "assistant-ended-call"
     handle = await context.session.generate_reply(
@@ -78,7 +80,6 @@ async def end_call(context: RunContext) -> str:
     await handle.wait_for_playout()
     await asyncio.sleep(1.5)
     # Enviar SIP BYE al participante para colgar la llamada en el lado del cliente.
-    room = context.userdata.get("_room")
     if room:
         for p in room.remote_participants.values():
             if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
@@ -96,6 +97,7 @@ async def end_call(context: RunContext) -> str:
                 finally:
                     await lk_api.aclose()
                 break
+    logger.info("end_call: llamando session.shutdown(drain=True) (room=%s)", room.name if room else "desconocida")
     context.session.shutdown(drain=True)
     # Suprimir el turno LLM post-tool (después de return ""), pero NO antes,
     # para que generate_reply arriba pueda pasar por llm_node normalmente.
@@ -807,23 +809,34 @@ async def generar_ticket_soporte_fuera_horario(
     nombre_cliente: str,
     detalle_intento_transferencia: str,
 ) -> str:
-    """Registra un ticket de soporte fuera del horario laboral cuando el cliente intentó
-    hablar con un asesor humano pero no fue posible por estar fuera de horario.
+    """Registra un ticket de seguimiento cuando el cliente intentó hablar con un asesor humano
+    pero no fue posible contactarlo — ya sea por estar fuera de horario laboral o porque
+    ningún asesor contestó la transferencia.
     Usa esta herramienta cuando el cliente acepte dejar sus datos para seguimiento.
     IMPORTANTE: Antes de llamar esta herramienta SIEMPRE debes:
     1. Pedir al cliente su nombre completo.
-    2. Pedir su número de teléfono a 10 dígitos y confirmarlo repitiéndolo en pares.
-       Ejemplo: "Tengo treinta y tres, noventa y cuatro, cero cero, ochenta y cuatro — ¿es correcto?"
-       Si el cliente corrige algún dígito, actualiza y confirma de nuevo antes de continuar.
+    2. Pedir su número de teléfono a 10 dígitos y llamar esta herramienta de inmediato con
+       el número exactamente como el cliente lo dijo — NO cuentes los dígitos tú mismo ni
+       confirmes el número por tu cuenta antes de llamar la herramienta: la herramienta valida
+       la longitud y pide la confirmación en pares automáticamente, y te dirá exactamente
+       qué decir si el número está incompleto o necesita confirmación.
     NUNCA uses datos del contexto ni inventes información.
 
     Args:
-        numero_telefono: Número de teléfono a 10 dígitos confirmado por el cliente.
+        numero_telefono: Número de teléfono a 10 dígitos tal como lo dijo el cliente, sin validar.
         nombre_cliente: Nombre completo proporcionado por el cliente en esta conversación.
         detalle_intento_transferencia: Motivo por el que el cliente quería hablar con un asesor.
     """
     if context.userdata.get("_ticket_fuera_horario_en_progreso"):
         return ""
+
+    ahora = datetime.now(ZoneInfo("America/Mexico_City"))
+    es_horario_laboral = ahora.weekday() < 5 and 9 <= ahora.hour < 18
+    mensaje_seguimiento = (
+        "Un asesor se comunicará con usted a la brevedad."
+        if es_horario_laboral
+        else "Un asesor se comunicará en horario laboral (lunes a viernes 9 AM - 6 PM)."
+    )
 
     digits = "".join(c for c in str(numero_telefono) if c.isdigit())
     if len(digits) != 10:
@@ -889,13 +902,10 @@ async def generar_ticket_soporte_fuera_horario(
                     context.userdata["ticket_id"] = str(ticket_id)
                     return (
                         f"Ticket registrado exitosamente. El folio de seguimiento es {ticket_id}. "
-                        "Un asesor se comunicará en horario laboral (lunes a viernes 9 AM - 6 PM)."
+                        + mensaje_seguimiento
                     )
                 logger.warning("Unexpected API response format: %s", data)
-                return (
-                    "Datos registrados exitosamente. "
-                    "Un asesor se comunicará en horario laboral (lunes a viernes 9 AM - 6 PM)."
-                )
+                return "Datos registrados exitosamente. " + mensaje_seguimiento
 
     except Exception as exc:
         logger.error("Error generando ticket fuera de horario: %s", exc)
@@ -973,7 +983,7 @@ async def transferencia_llamada(context: RunContext) -> str:
 WARM_TRANSFER_PHONE = "523379797979"
 #WARM_TRANSFER_PHONE = "523333940084"
 # ID del trunk saliente configurado en LiveKit Cloud.
-WARM_TRANSFER_TRUNK_ID = "ST_oTqtm7RzK7k6"
+WARM_TRANSFER_TRUNK_ID = "ST_JpMYqLiBtAuG"
 # Número que verá el asesor cuando Sofia le llame (caller ID).
 WARM_TRANSFER_SIP_NUMBER = "523321012739"
 
@@ -1058,18 +1068,34 @@ async def transferencia_llamada_warm(context: RunContext) -> str:
             instructions="Informa al cliente brevemente que ya lo conectaste con el asesor y despídete."
         )
         await handle2.wait_for_playout()
+        # El asesor humano ya fue movido a esta sala (WarmTransferTask._merge_calls) y
+        # queda conversando directo con el cliente. Dejamos el INPUT activo a propósito
+        # (la transcripción de esa conversación sigue sirviendo para el log/monitoreo);
+        # solo apagamos el audio de salida para que no se le vuelva a escuchar.
+        # Como el input sigue activo, el LLM podría seguir "razonando" sobre lo que
+        # escucha y decidir llamar una herramienta (ej. end_call, que desconectaría al
+        # asesor de la sala) sin que nadie la oiga decidirlo — por eso quitamos todas
+        # las herramientas de este agente, así no puede ejecutar nada más.
+        # NO usamos session.shutdown(): delete_room_on_close=True borraría la sala y
+        # cortaría el puente recién creado entre cliente y asesor. El cierre real de la
+        # llamada lo maneja close_on_disconnect (default True) cuando el cliente original
+        # se desconecte de la sala — independiente de las herramientas del agente.
+        context.session.output.set_audio_enabled(False)
+        await context.session.current_agent.update_tools([])
     except (ToolError, Exception) as exc:
         if not watchdog_task.done():
             watchdog_task.cancel()
         logger.error("Warm transfer fallido: %s", exc)
         handle2 = await context.session.generate_reply(
             instructions=(
-                "Informa al cliente brevemente que no fue posible conectar con un asesor en este momento "
-                "y despídete amablemente. No hagas más preguntas."
+                "Informa al cliente con empatía que en este momento no fue posible conectar con un asesor. "
+                "Pregúntale si desea dejar su nombre y número de teléfono para que un asesor lo contacte "
+                "más tarde. Espera su respuesta antes de continuar — no te despidas todavía. "
+                "Si el cliente acepta, pide su nombre completo y luego su número a 10 dígitos, y llama "
+                "generar_ticket_soporte_fuera_horario. Si el cliente no acepta, despídete amablemente."
             )
         )
         await handle2.wait_for_playout()
-        context.session.shutdown(drain=True)
         context.userdata["_suppress_post_tool_llm"] = True
         return ""
 
@@ -1522,7 +1548,9 @@ async def _suppress_text_llm_node(agent_self, chat_ctx, tools, model_settings, p
         raw = await raw
 
     # Suprimir el turno LLM post-tool (después de que end_call ya generó despedida).
-    if agent_self.session.userdata.get("_suppress_post_tool_llm"):
+    # pop() en vez de get(): se consume una sola vez, para no silenciar turnos futuros
+    # si la sesión sigue viva después (ej. transferencia_llamada_warm fallida).
+    if agent_self.session.userdata.pop("_suppress_post_tool_llm", False):
         async for _ in raw:
             pass
         return
@@ -1614,7 +1642,7 @@ class AgenteRecepcionista(Agent):
         if asyncio.iscoroutine(raw):
             raw = await raw
 
-        if self.session.userdata.get("_suppress_post_tool_llm"):
+        if self.session.userdata.pop("_suppress_post_tool_llm", False):
             async for _ in raw:
                 pass
             return
@@ -1888,7 +1916,7 @@ async def entrypoint(ctx: JobContext):
                             "referencia",
                             "número de casa",
                             "número de lote",
-                            "checar",
+                            "Ixtlahuacán",
                             "reportar",
                             "contraseña",
                             "WiFi",
@@ -1898,17 +1926,17 @@ async def entrypoint(ctx: JobContext):
                             "agente real",
                             "pagando",
                             "cansado",
-                            "robando",
+                            "Tesistán",
                             "señal",
                             "lento",
                             "intermitente",
-                            "reiniciar",
+                            "Zapopan",
                             "router",
                             "módem",
-                            "técnico",
+                            "Zapotlanejo",
                             "visita técnica",
-                            "seguro",
-                            "servicio",
+                            "tlaquepaque",
+                            "Tonalá",
                         ],
                         "eager_eot_threshold": 0.7,
                         "eot_threshold": 0.9,
@@ -1989,6 +2017,7 @@ async def entrypoint(ctx: JobContext):
         logger.info("Usage summary: %s", summary)
 
     async def send_end_call_report():
+        logger.info("send_end_call_report: shutdown callback invocado")
         fin_llamada = datetime.now(tz_cdmx)
         duracion = int((fin_llamada - inicio_llamada).total_seconds())
 
@@ -1999,8 +2028,10 @@ async def entrypoint(ctx: JobContext):
         transcript_lines = ud.get("_transcript") or []
         transcripcion = "\n".join(transcript_lines) or None
 
-        resumen = await _generate_summary(transcripcion)
-        nombre_cliente_transcripcion = await _obtener_nombre_cliente(transcripcion)
+        resumen, nombre_cliente_transcripcion = await asyncio.gather(
+            _generate_summary(transcripcion),
+            _obtener_nombre_cliente(transcripcion),
+        )
 
         payload = {
             "cliente": {
@@ -2031,12 +2062,17 @@ async def entrypoint(ctx: JobContext):
 
         try:
             async with aiohttp.ClientSession() as http:
-                await http.post(
+                async with http.post(
                     "https://lab.conbiz.ai/webhook/end-call-report",
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=15),
-                )
-            logger.info("End-call report enviado correctamente")
+                ) as resp:
+                    body = await resp.text()
+                    logger.info(
+                        "End-call report — status=%s body=%s",
+                        resp.status,
+                        body[:500],
+                    )
         except Exception as exc:
             logger.error("Error enviando end-call report: %s", exc)
 
@@ -2177,5 +2213,8 @@ if __name__ == "__main__":
             agent_name="sofia-obbi",
             entrypoint_fnc=entrypoint,
             request_fnc=_accept_agent_job,
+            # Default es 10s — insuficiente para que send_end_call_report (2 llamadas a
+            # Gemini + POST a n8n) termine antes de que el worker mate el job a la fuerza.
+            shutdown_process_timeout=30.0,
         )
     )
